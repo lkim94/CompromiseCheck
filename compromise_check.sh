@@ -123,18 +123,32 @@ check_hidden_tmp() {
 # or run inside any container. This is what surfaced both real intrusions.
 check_container_tmp() {
   [ "$docker_ok" -eq 1 ] || return 0
-  local cid name line path
+  local cid name line path base rest
   for cid in $(docker ps -aq 2>/dev/null); do
     name=$(docker inspect -f '{{.Name}}' "$cid" 2>/dev/null | tr -d '/')
     [ -z "$name" ] && name="$cid"
     while IFS= read -r line; do
       [ -z "$line" ] && continue
       path="${line#? }"
-      case "$path" in
-        /tmp) continue ;;                       # dir itself changing is normal
-        /tmp/.*) finding HIGH container_hidden_tmp "$name: $line" ;;
-        /tmp/*)  finding LOW  container_tmp_file   "$name: $line" ;;
+      [ "$path" = "/tmp" ] && continue        # dir itself changing is normal
+      base="${path##*/}"
+
+      # Hidden file at ANY depth -> always report, never baselined.
+      # This is the pattern behind both real intrusions (.kworkerd, .n).
+      case "$base" in
+        .*) finding HIGH container_hidden_tmp "$name: $line"; continue ;;
       esac
+
+      # Non-hidden: only track top-level /tmp entries, and route them through
+      # the baseline so routine caches (Playwright profiles, Grafana plugin
+      # extracts, build dirs) report once and then stay quiet. Deeper paths are
+      # skipped - their top-level parent already covers them, and listing a
+      # whole Chromium profile tree buries real findings.
+      rest="${path#/tmp/}"
+      case "$rest" in
+        */*) continue ;;                      # deeper than one level
+      esac
+      state container_tmp_file "$name:$rest"
     done < <(docker diff "$cid" 2>/dev/null | grep -E '^[ACD] /tmp')
   done
 }
@@ -333,6 +347,8 @@ if [ "$USE_BASELINE" -eq 1 ] && [ -f "$BASELINE" ]; then
         finding HIGH "new_$check" "$value" ;;
       outbound_peer|listening|container|name_mismatch)
         finding MEDIUM "new_$check" "$value" ;;
+      container_tmp_file)
+        finding LOW "new_container_tmp" "$value" ;;
       *) finding LOW "new_$check" "$value" ;;
     esac
   done < <(comm -13 "$BASELINE" "$CURRENT_STATE")
